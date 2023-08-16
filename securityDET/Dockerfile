@@ -11,7 +11,7 @@ WORKDIR /app
 RUN pip install -r requirements.txt
 
 # 暴露容器端口（如果你的Flask应用监听不同的端口，请将下面的端口号改为相应的端口）
-EXPOSE 8080
+EXPOSE 8083
 
-# 运行Python项目
-CMD ["python", "security.py"]
+# 运行Python项目并将输出重定向回终端
+CMD ["python", "security.py"] 

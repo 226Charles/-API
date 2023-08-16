@@ -8,10 +8,6 @@ from flask import request
 from datetime import datetime, timedelta
 from collections import defaultdict
 import requests
-from collections import deque
-import logging
-import sys
-
 
 # 指定目标URL
 # 部署时改为内网
@@ -162,60 +158,19 @@ def logic_control(vibration_acceleration, gas_concentration, persist_time, old_v
         ans = False
     return ans,change
 
-class CircularBuffer:
-    def __init__(self, size):
-        self.size = size
-        self.buffer = deque(maxlen=size)
-        self.current_index = -1  # 初始化为-1，表示尚未添加元素
+def cleanup_expired_cache():
+    now = datetime.now()
+    expired_keys = [key for key, data in data_cache.items() if now - data.get('timestamp', datetime.min) > timedelta(seconds=CACHE_EXPIRATION)]
+    for key in expired_keys:
+        data_cache.pop(key, None)
 
-    def append(self, item):
-        self.current_index = (self.current_index + 1) % self.size
-        if len(self.buffer) < self.size:
-            self.buffer.append(item)
-        else:
-            self.buffer[self.current_index] = item
+# 用于缓存上一组数据
+data_cache = {}
 
-    def modify_current(self, modification_function):
-        if self.current_index >= 1:
-            self.buffer[self.current_index] = modification_function(self.buffer[self.current_index],self.get_previous())
-        else:
-            raise ValueError("No data to modify yet")
-
-    def get_previous(self):
-        if len(self.buffer) >= 2:
-            previous_index = (self.current_index - 1) % self.size
-            return self.buffer[previous_index]
-        else:
-            raise ValueError("Not enough elements in the buffer to get previous")
-
-    def is_empty(self):
-        return len(self.buffer) == 0
-
-def modify_function1(data1, data2):
-    data1['oldpers'] = data2['oldpers'] +5
-    return data1
-
-def modify_function2(data1, data2):
-    data1['oldpers'] = 0
-    return data1
-
-# 创建一个存储 deviceid 和对应 CircularBuffer 的字典
-device_buffers = {}
-
-# 存入数据到对应的 CircularBuffer，如果没有找到对应的 deviceid 则创建新的 CircularBuffer
-def append_data(deviceid, data, buffer_size):
-    if deviceid not in device_buffers:
-        device_buffers[deviceid] = CircularBuffer(buffer_size)
-    device_buffers[deviceid].append(data)
-
-buffer_size = 1000
+# 定义缓存有效期（以秒为单位）
+CACHE_EXPIRATION = 60 * 10  # 10分钟;
 TIME_DELTA_SECONDS = 5  # 5秒的时间间隔，单位为秒
 
-@app.route('/api/test', methods=['GET'])
-def test():
-    print("hehe")
-    print('It is working',file=sys.stderr)
-    return "hello"
 
 @app.route('/api/safety', methods=['GET'])
 def main():
@@ -227,53 +182,84 @@ def main():
     vibration_acceleration_threshold = float(request.args.get('vibthr'))
     gas_concentration_threshold = float(request.args.get('gasthr'))
 
+    '''
+    测试通过
+    当前风机100
+    浓度99
+    持续时间0
+    上一帧风机350
+    浓度99
+    持续时间1800
+    '''
     time = int(request.args.get('time'))
     device_id = request.args.get('id')
     vibration_acceleration = float(request.args.get('vib'))
     gas_concentration = float(request.args.get('gas'))
+    #persist_time = int(request.args.get('pers'))
+
+    # 计算 previous_time 和 now_time，不需要转换为 datetime 对象
+    previous_time = time - (TIME_DELTA_SECONDS * 1000)
+    now_time = time
+
+    # 构建唯一键
+    cache_key = f"{device_id}_{previous_time}"
+    now_cache_key = f"{device_id}_{now_time}"
+    '''# 构建唯一键，使用当前时间减去 5 秒作为 time
+    previous_time = datetime.strptime(time, '%Y%m%d%H%M%S') - TIME_DELTA
+    now_time = datetime.strptime(time, '%Y%m%d%H%M%S')
+    cache_key = f"{device_id}_{previous_time.strftime('%Y%m%d%H%M%S')}"
+    now_cache_key = f"{device_id}_{now_time.strftime('%Y%m%d%H%M%S')}"'''
+    #print(cache_key)
+    #print(now_cache_key)
+
+    # 清理过期数据
+    cleanup_expired_cache()
 
     # 从缓存中获取上一组数据
-    old_vibration_acceleration = 0
-    old_gas_concentration = 0
-    old_persist_time = 0
-    persist_time = 0
-
-    flag_null = False
-    #检查该设备是否有缓冲
-    if device_id not in device_buffers:
-        device_buffers[device_id] = CircularBuffer(buffer_size)  # 默认 buffer size 为 1000
+    cached_data = data_cache.get(cache_key)
+    if cached_data is None:
         cached_data = {
+            'timestamp': datetime.now(),  # 记录时间戳
             'oldvib': vibration_acceleration,
             'oldgas': gas_concentration,
             'oldpers': 0
         }
-        append_data(device_id, cached_data, 1000)
-        flag_null = True
-        old_vibration_acceleration = vibration_acceleration
-        old_gas_concentration = gas_concentration
-        old_persist_time = 0
-    else:
-        cached_data = {
-            'oldvib': vibration_acceleration,
-            'oldgas': gas_concentration,
-            'oldpers': 0
-        }
-        append_data(device_id, cached_data, 1000)
-        old_cached_data = device_buffers[device_id].get_previous()
-        old_vibration_acceleration = old_cached_data['oldvib']
-        old_gas_concentration = old_cached_data['oldgas']
-        old_persist_time = old_cached_data['oldpers']
+        data_cache[cache_key] = cached_data
+    
+    old_vibration_acceleration = cached_data.get('oldvib')
+    old_gas_concentration = cached_data.get('oldgas')
+    old_persist_time = cached_data.get('oldpers')
 
     persist_time = old_persist_time + TIME_DELTA_SECONDS
 
+    '''old_vibration_acceleration = float(request.args.get('oldvib'))
+    old_gas_concentration = float(request.args.get('oldgas'))
+    old_persist_time = int(request.args.get('oldpers'))'''
+    '''print(vibration_acceleration)
+    print(gas_concentration)
+    print(persist_time)
+    print(old_vibration_acceleration)
+    print(old_gas_concentration)
+    print(old_persist_time)'''
     ans,change = logic_control(vibration_acceleration, gas_concentration, persist_time, old_vibration_acceleration, old_gas_concentration, old_persist_time)
-    
+    #print(change)
     if change == True:
-        device_buffers[device_id].modify_current(modify_function2) #变了=0
+        # 将本次的数据保存到缓存中
+        data_cache[now_cache_key] = {
+            'timestamp': datetime.now(),  # 记录时间戳
+            'oldvib': vibration_acceleration,
+            'oldgas': gas_concentration,
+            'oldpers': 0
+        }
     else:
-        if flag_null == False:
-            device_buffers[device_id].modify_current(modify_function1) #没变+5
-    
+        # 将本次的数据保存到缓存中
+        data_cache[now_cache_key] = {
+            'timestamp': datetime.now(),  # 记录时间戳
+            'oldvib': vibration_acceleration,
+            'oldgas': gas_concentration,
+            'oldpers': persist_time
+        }
+    print(data_cache)
     response_data = {
         "safe": ans,
         "change": change,
@@ -298,8 +284,8 @@ def main():
         else:
             print(f"POST request failed with status code {response.status_code}")
 
-    print("-----------------------------", flush=True)
-    print("safe : {}, timestamp : {}, change : {}, vib : {}, gas : {}".format(ans,time,change,vibration_acceleration,gas_concentration), flush=True)
+    print("-----------------------------")
+    print("safe : {}, timestamp : {}, change : {}, vib : {}, gas : {}".format(ans,time,change,vibration_acceleration,gas_concentration))
 
     return jsonify(response_data)
 
