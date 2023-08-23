@@ -83,11 +83,11 @@ def type_3_judge(vibration_acceleration, gas_concentration, persist_time, old_vi
         return False
     
 '''
-状态4 停工后保持通风 检测5分钟
+状态4 停工后保持通风 检测30分钟
 '''
 def type_4_judge(vibration_acceleration, gas_concentration, persist_time, old_vibration_acceleration, old_gas_concentration, old_persist_time):
     if old_vibration_acceleration >= vibration_acceleration_threshold and old_gas_concentration < gas_concentration_threshold:
-        if  old_persist_time >= 300:
+        if  old_persist_time >= 1800:
             return True
         else:
             return False
@@ -104,7 +104,7 @@ def type_5_judge(vibration_acceleration, gas_concentration, persist_time, old_vi
     else:
         return False
 
-
+        
 def type_judge(vibration_acceleration, gas_concentration, persist_time, old_vibration_acceleration, old_gas_concentration, old_persist_time):
     
     flag = 0
@@ -114,6 +114,10 @@ def type_judge(vibration_acceleration, gas_concentration, persist_time, old_vibr
     if vibration_acceleration < vibration_acceleration_threshold and gas_concentration < gas_concentration_threshold:
         flag = 0
         if old_vibration_acceleration >= vibration_acceleration_threshold and old_gas_concentration < gas_concentration_threshold:
+            flag = 4
+            change = True
+        elif old_vibration_acceleration >= vibration_acceleration_threshold and old_gas_concentration >= gas_concentration_threshold:
+            flag = 10#缺失工作后通风
             change = True
     else:
         if vibration_acceleration >= vibration_acceleration_threshold and gas_concentration < gas_concentration_threshold:
@@ -135,6 +139,9 @@ def type_judge(vibration_acceleration, gas_concentration, persist_time, old_vibr
                     change = True
                 elif old_vibration_acceleration >= vibration_acceleration_threshold and old_gas_concentration >= gas_concentration_threshold:
                     flag = 2
+                elif old_vibration_acceleration < vibration_acceleration_threshold and old_gas_concentration < gas_concentration_threshold:
+                    flag = 10#缺失工作前通风
+                    change = True
             else:
                 flag = 10
     
@@ -143,6 +150,7 @@ def type_judge(vibration_acceleration, gas_concentration, persist_time, old_vibr
 def logic_control(vibration_acceleration, gas_concentration, persist_time, old_vibration_acceleration, old_gas_concentration, old_persist_time):
 
     ans = False
+    work = False
     
     flag,change = type_judge(vibration_acceleration, gas_concentration, persist_time, old_vibration_acceleration, old_gas_concentration, old_persist_time)
 
@@ -160,7 +168,10 @@ def logic_control(vibration_acceleration, gas_concentration, persist_time, old_v
         ans = type_5_judge(vibration_acceleration, gas_concentration, persist_time, old_vibration_acceleration, old_gas_concentration, old_persist_time)
     else:
         ans = False
-    return ans,change
+
+    if(flag != 0):
+        work = True
+    return ans,change,work
 
 class CircularBuffer:
     def __init__(self, size):
@@ -176,14 +187,14 @@ class CircularBuffer:
             self.buffer[self.current_index] = item
 
     def modify_current(self, modification_function):
-        if self.current_index >= 1:
+        if self.current_index >= 0:
             self.buffer[self.current_index] = modification_function(self.buffer[self.current_index],self.get_previous())
         else:
             raise ValueError("No data to modify yet")
 
     def get_previous(self):
         if len(self.buffer) >= 2:
-            previous_index = (self.current_index - 1) % self.size
+            previous_index = (self.current_index - 1 + self.size) % self.size
             return self.buffer[previous_index]
         else:
             raise ValueError("Not enough elements in the buffer to get previous")
@@ -201,6 +212,7 @@ def modify_function2(data1, data2):
 
 # 创建一个存储 deviceid 和对应 CircularBuffer 的字典
 device_buffers = {}
+device_work = {}
 
 # 存入数据到对应的 CircularBuffer，如果没有找到对应的 deviceid 则创建新的 CircularBuffer
 def append_data(deviceid, data, buffer_size):
@@ -216,6 +228,17 @@ def test():
     print("hehe")
     print('It is working',file=sys.stderr)
     return "hello"
+
+@app.route('/api/work', methods=['GET'])
+def is_Work():
+    device_id = request.args.get('id')
+    is_work = device_work[device_id]
+
+    ans = {
+        "work" : is_work
+    }
+
+    return jsonify(ans)
 
 @app.route('/api/safety', methods=['GET'])
 def main():
@@ -266,7 +289,7 @@ def main():
 
     persist_time = old_persist_time + TIME_DELTA_SECONDS
 
-    ans,change = logic_control(vibration_acceleration, gas_concentration, persist_time, old_vibration_acceleration, old_gas_concentration, old_persist_time)
+    ans,change,work = logic_control(vibration_acceleration, gas_concentration, persist_time, old_vibration_acceleration, old_gas_concentration, old_persist_time)
     
     if change == True:
         device_buffers[device_id].modify_current(modify_function2) #变了=0
@@ -274,6 +297,8 @@ def main():
         if flag_null == False:
             device_buffers[device_id].modify_current(modify_function1) #没变+5
     
+    device_work[device_id] = work
+
     response_data = {
         "safe": ans,
         "change": change,
