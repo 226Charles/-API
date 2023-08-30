@@ -11,11 +11,17 @@ import requests
 from collections import deque
 import logging
 import sys
+import redis
+from redis import ConnectionPool
+import json
+import numpy as np
+
+
 
 #8.28时间戳改为相减 毫秒级 完成
 #传公司镜像
-#内存改redis
-#外面套一层 处理噪音
+#内存改redis 完成
+#外面套一层 处理噪音 完成
 
 
 # 指定目标URL
@@ -34,6 +40,13 @@ app = Flask(__name__)
 CORS(app)
 vibration_acceleration_threshold = 0
 gas_concentration_threshold = 0
+
+# 创建连接池
+pool = ConnectionPool(host='localhost', port=6379, db=1, decode_responses=True)
+
+# 连接到 Redis 服务器
+redis_client = redis.Redis(connection_pool=pool)
+
 
 '''
 初始状态判断：气体< 加速度< 
@@ -209,6 +222,24 @@ class CircularBuffer:
 
     def is_empty(self):
         return len(self.buffer) == 0
+    
+    def to_dict(self):
+        return {
+            "size": self.size,
+            "buffer": list(self.buffer),
+            "current_index": self.current_index
+        }
+
+# 定义一个自定义的 JSONEncoder 子类，用于将 CircularBuffer 转换为 JSON 格式
+class CircularBufferEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, CircularBuffer):
+            return {
+                "size": obj.size,
+                "buffer": obj.buffer,
+                "current_index": obj.current_index
+            }
+        return super().default(obj)
 
 def modify_function1(data1, data2):
     data1['oldpers'] = data2['oldpers'] + (data1['time'] - data2['time'])
@@ -230,34 +261,59 @@ def append_data(deviceid, data, buffer_size):
 
 buffer_size = 1000
 
-@app.route('/api/test', methods=['GET'])
+class DataProcessor:
+    def __init__(self, batch_size, vib_threshold, gas_threshold):
+        self.batch_size = batch_size
+        self.vib_threshold = vib_threshold
+        self.gas_threshold = gas_threshold
+        self.data_list = []
+    
+    def process_data(self, new_data):
+        vib_data = new_data["vib"]
+        gas_data = new_data["gas"]
+        
+        self.data_list.append(new_data)
+        if len(self.data_list) >= self.batch_size:
+            self._process_batch(vib_data, gas_data)
+    
+    def _process_batch(self, vib_data, gas_data):
+        batch_data = self.data_list
+        vib_variances = [np.var([entry["vib"] for entry in batch_data[:i]] + [entry["vib"] for entry in batch_data[i+1:]]) for i in range(len(batch_data))]
+        gas_variances = [np.var([entry["gas"] for entry in batch_data[:i]] + [entry["gas"] for entry in batch_data[i+1:]]) for i in range(len(batch_data))]
+
+        vib_min_variance_index = np.argmin(vib_variances)
+        gas_min_variance_index = np.argmin(gas_variances)
+        current_vib_variance = np.var([entry["vib"] for entry in batch_data])
+        current_gas_variance = np.var([entry["gas"] for entry in batch_data])
+        
+        if abs(current_vib_variance - vib_variances[vib_min_variance_index]) > self.vib_threshold:
+            removed_data = self.data_list.pop(vib_min_variance_index)
+            print(f"Removed data {removed_data} due to high vib variance")
+        if abs(current_gas_variance - gas_variances[gas_min_variance_index]) > self.gas_threshold:
+            removed_data = self.data_list.pop(gas_min_variance_index)
+            print(f"Removed data {removed_data} due to high gas variance")
+    
+    def get_data_list(self):
+        return self.data_list
+    
+    def _is_batch_full(self):
+        return len(self.data_list) == self.batch_size
+    
+    def get_and_remove_first_data(self):
+        if len(self.data_list) == self.batch_size:
+            first_data = self.data_list.pop(0)
+            print(f"Removed and returned first data {first_data}")
+            return first_data
+        else:
+            print("No data to remove.")
+            return None
+    
+@app.route('/api/noise', methods=['GET'])
 def test():
-    print("hehe")
-    print('It is working',file=sys.stderr)
-    return "hello"
-
-@app.route('/api/work', methods=['GET'])
-def is_Work():
-    device_id = request.args.get('id')
-    
-    if device_id is None:
-        return jsonify({"error": "Missing 'id' parameter"}), 400  # 返回一个错误响应
-    
-    try:
-        is_work = device_work[device_id]
-        ans = {
-            "work": is_work
-        }
-        return jsonify(ans)
-    except KeyError:
-        return jsonify({"error": "Device not found"}), 404  # 返回一个错误响应
-
-
-@app.route('/api/safety', methods=['GET'])
-def main():
 
     global vibration_acceleration_threshold
     global gas_concentration_threshold
+    batch_size = 12
 
     #风机阈值300 浓度阈值100
     vibration_acceleration_threshold = float(request.args.get('vibthr'))
@@ -267,6 +323,82 @@ def main():
     device_id = request.args.get('id')
     vibration_acceleration = float(request.args.get('vib'))
     gas_concentration = float(request.args.get('gas'))
+    vs = float(request.args.get('vs'))
+    gs = float(request.args.get('gs'))
+
+    processor = DataProcessor(batch_size, vs, gs)
+
+    value = redis_client.hget("device_noise", device_id)
+    device_noise = []
+    first_data = {}
+    temp_cached = {
+            'vibthr': vibration_acceleration_threshold,
+            'gasthr': gas_concentration_threshold,
+            'time':time,
+            'id':device_id,
+            'vib':vibration_acceleration,
+            'gas':gas_concentration,
+            'vs':vs,
+            'gs':gs
+        }
+    
+    if value == None:
+        device_noise.append(temp_cached)
+        redis_client.hset("device_noise", device_id, json.dumps(device_noise))
+    else:
+        old_device_noise = json.loads(value)
+        old_device_noise.append(temp_cached)
+        for data in old_device_noise:
+            processor.process_data(data)
+        final_processed_data = processor.get_data_list()
+        print(len(processor.data_list))
+        if processor._is_batch_full():
+            first_data = processor.get_and_remove_first_data()
+        redis_client.hset("device_noise", device_id, json.dumps(final_processed_data))
+
+    #print(first_data)
+    if(first_data == {}):
+        return jsonify({"error":"data is not enough"})
+    else:
+        vibration_acceleration_threshold = first_data['vibthr']
+        gas_concentration_threshold = first_data['gasthr']
+        time = first_data['time']
+        device_id = first_data['id']
+        vibration_acceleration = first_data['vib']
+        gas_concentration = first_data['gas']
+        return safety(vibration_acceleration_threshold,gas_concentration_threshold,time,device_id,vibration_acceleration,gas_concentration)
+
+@app.route('/api/work', methods=['GET'])
+def is_Work():
+    device_id = request.args.get('id')
+    
+    if device_id is None:
+        return jsonify({"error": "Missing 'id' parameter"}), 400  # 返回一个错误响应
+    
+    try:
+        #is_work = device_work[device_id]
+        work = redis_client.hget("device_work", device_id)
+        is_work = False
+        print(work)
+        if work is not None and int(work) == 1:
+            is_work = True
+        ans = {
+            "work": is_work
+        }
+        return jsonify(ans)
+    except KeyError:
+        return jsonify({"error": "Device not found"}), 404  # 返回一个错误响应
+
+def safety(vibration_acceleration_threshold,gas_concentration_threshold,time,device_id,vibration_acceleration,gas_concentration):
+
+    #风机阈值300 浓度阈值100
+    '''vibration_acceleration_threshold = float(request.args.get('vibthr'))
+    gas_concentration_threshold = float(request.args.get('gasthr'))
+
+    time = int(request.args.get('time'))
+    device_id = request.args.get('id')
+    vibration_accelertaion = float(request.args.get('vib'))
+    gas_concentration = float(request.args.get('gas'))'''
 
     # 从缓存中获取上一组数据
     old_vibration_acceleration = 0
@@ -275,9 +407,11 @@ def main():
     old_time = time
     persist_time = 0
 
+    value = redis_client.hget("device_buffers", device_id)
     flag_null = False
     #检查该设备是否有缓冲
-    if device_id not in device_buffers:
+    if value == None:
+        print(f"Field {device_id} does not exist in the hash table.")
         device_buffers[device_id] = CircularBuffer(buffer_size)  # 默认 buffer size 为 1000
         cached_data = {
             'oldvib': vibration_acceleration,
@@ -297,6 +431,15 @@ def main():
             'time':time,
             'oldpers': 0
         }
+        stored_circular_buffer_data = value
+        if stored_circular_buffer_data:
+            stored_circular_buffer_data = json.loads(stored_circular_buffer_data)
+            device_buffers[device_id] = CircularBuffer(stored_circular_buffer_data["size"])
+            device_buffers[device_id].buffer = deque(stored_circular_buffer_data["buffer"])
+            device_buffers[device_id].current_index = stored_circular_buffer_data["current_index"]
+            #print(device_buffers[device_id].buffer)
+        else:
+            print(f"No CircularBuffer data found for device: {device_id}")
         append_data(device_id, cached_data, 1000)
         old_cached_data = device_buffers[device_id].get_previous()
         old_vibration_acceleration = old_cached_data['oldvib']
@@ -316,7 +459,18 @@ def main():
             device_buffers[device_id].modify_current(modify_function1) #没变+时间戳
     
     device_work[device_id] = work
+    if(work == False):
+        work = 0
+    else:
+        work = 1
+    redis_client.hset("device_work", device_id, int(work))
 
+    # 存储 CircularBuffer 实例到 Redis
+    #buffer_data = json.dumps(device_buffers[device_id], cls=CircularBufferEncoder)
+    buffer_data = json.dumps(device_buffers[device_id].to_dict())
+    redis_client.hset("device_buffers", device_id, buffer_data)
+    #redis_client.hset("device_buffers", device_id, json.dumps(device_buffers[device_id]))
+    
     response_data = {
         "safe": ans,
         "change": change,
